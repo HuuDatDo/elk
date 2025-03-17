@@ -154,8 +154,8 @@ class LinActLinGLU(eqx.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         # x: (length, input_size)
         # returns: (length, hidden_size)
-        x = jax.nn.gelu(self.lin0(x))
-        x = jax.nn.glu(self.lin1(x))
+        x = jax.nn.gelu(vmap_to_shape(self.lin0, x.shape)(x))
+        x = jax.nn.glu(vmap_to_shape(self.lin1, x.shape)(x))
         return x
 
 class SingleScaleGRU(eqx.Module):
@@ -163,11 +163,14 @@ class SingleScaleGRU(eqx.Module):
     nlayer: int
     encoder: MLP
     grus: List[List[GRU]]
+    bi_grus: List[List[GRU]]
+    acts: List[LinActLinGLU]
     mlps: List[MLP]
     classifier: MLP
     norms: List[eqx.nn.LayerNorm]
     dropout: eqx.nn.Dropout
     dropout_key: prng.PRNGKeyArray
+    bidirectional: bool
     use_scan: bool
     quasi: bool  # XG addition
 
@@ -179,13 +182,19 @@ class SingleScaleGRU(eqx.Module):
         nlayer: int,
         nclass: int,
         key: prng.PRNGKeyArray,
+        bidirectional: bool,
         use_scan: bool,
         quasi: bool,
     ):
-        keycount = 1 + (nchannel + 1) * nlayer + 1 + 1  # +1 for dropout
+        if bidirectional:
+            keycount = 1 + (nchannel + 2) * nlayer * 2 + 1 + 1  # +1 for dropout
+        else:
+            keycount = 1 + (nchannel + 2) * nlayer + 1 + 1  # +1 for dropout
+        
         print(f"Keycount: {keycount}")
         keys = jax.random.split(key, keycount)
 
+        self.bidirectional = bidirectional
         self.nchannel = nchannel
         self.nlayer = nlayer
 
@@ -208,28 +217,45 @@ class SingleScaleGRU(eqx.Module):
             ]
             for j in range(nlayer)
         ]
+        if bidirectional:
+            self.bi_grus = [
+                [
+                    GRU(
+                        ninp=nstate,
+                        nstate=gru_nstate,
+                        key=keys[int(nchannel*nlayer + (nchannel * j) + i)],
+                        use_scan=use_scan,
+                    )
+                    for i in range(nchannel)
+                ]
+                for j in range(nlayer)
+            ]
         self.mlps = [
             MLP(
                 ninp=nstate,
                 nstate=nstate,
                 nout=nstate,
-                key=keys[int(i + 1 + nchannel * nlayer)],
+                key=keys[int(i + 1 + 2 * nchannel * nlayer)],
             )
+            for i in range(nlayer)
+        ]
+        self.acts = [
+            LinActLinGLU(hidden_size=nstate, key=keys[int(i + 1 + 2 * (nchannel + 1) * nlayer)])
             for i in range(nlayer)
         ]
         assert len(self.grus) == nlayer
         assert len(self.grus[0]) == nchannel
-        print(
-            f"scale_grus random keys end at index {int(1 + (nchannel * (nlayer - 1)) + (nchannel - 1))}"
-        )
-        print(f"mlps random keys end at index {int((nchannel * nlayer) + nlayer)}")
+        # print(
+        #     f"scale_grus random keys end at index {int(1 + (nchannel * (nlayer - 1)) + (nchannel - 1))}"
+        # )
+        # print(f"mlps random keys end at index {int((nchannel * nlayer) + nlayer)}")
 
         # project nstate in the feature dimension to nclasses for classification
         self.classifier = MLP(
             ninp=nstate,
             nstate=nstate,
             nout=nclass,
-            key=keys[int((nchannel + 1) * nlayer + 1)],
+            key=keys[int((nchannel + 2) * nlayer * 2 + 1)],
         )
 
         self.norms = [
@@ -271,6 +297,18 @@ class SingleScaleGRU(eqx.Module):
                         quasi=self.quasi,  # XG addition
                         qmem_efficient=False,  # XG addition
                     )
+                    if self.bidirectional:
+                        x_back, samp_iters_back = seq1d(
+                            model_func,
+                            h0,
+                            inputs[::-1],
+                            self.bi_grus[i][ch],
+                            yinit_guess,
+                            quasi=self.quasi,  # XG addition
+                            qmem_efficient=False,  # XG addition
+                        )
+                        x_back = x_back[::-1]
+                        x = (x + x_back) / 2
                 else:
                     x, samp_iters = seq1d(
                         model_func,
@@ -280,9 +318,22 @@ class SingleScaleGRU(eqx.Module):
                         yinit_guess,
                         quasi=self.quasi,  # XG addition
                     )
+                    if self.bidirectional:
+                        x_back, samp_iters_back = seq1d(
+                            model_func,
+                            h0,
+                            inputs[::-1],
+                            self.bi_grus[i][ch],
+                            yinit_guess,
+                            quasi=self.quasi,  # XG addition
+                            qmem_efficient=False,  # XG addition
+                        )
+                        x_back = x_back[::-1]
+                        x = (x + x_back) / 2
                 x_from_all_channels.append(x)
 
             x = jnp.concatenate(x_from_all_channels, axis=-1)
+            x = self.acts[i](x)
             x = jax.vmap(self.norms[i + 1])(  # XG change
                 x + inputs
             )  # add and norm after multichannel GRU layer
@@ -355,7 +406,6 @@ def grad_norm(grads) -> jnp.ndarray:
 
 
 def compute_metrics(logits: jnp.ndarray, labels: jnp.ndarray) -> Dict[str, jnp.ndarray]:
-    print(f"inside of compute_metrics, logits shape is {logits.shape}, labels shape is {labels.shape}")
     loss = jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, labels))
     accuracy = jnp.mean(jnp.argmax(logits, -1) == labels)
     metrics = {"loss": loss, "accuracy": accuracy}
@@ -486,6 +536,7 @@ def train():
     parser.add_argument("--patience", type=int, default=1000)
     parser.add_argument("--patience_metric", type=str, default="accuracy")
     parser.add_argument("--precision", type=int, default=32)
+    parser.add_argument("--bidirectional", action="store_true", help="Doing --bidirectional sets it to True")
     parser.add_argument(
         "--use_scan", action="store_true", help="Doing --use_scan sets it to True"
     )
@@ -514,6 +565,7 @@ def train():
     batch_size = args.batch_size
     patience = args.patience
     patience_metric = args.patience_metric
+    bidirectional = args.bidirectional
     use_scan = args.use_scan
     quasi = args.quasi  # XG addition
 
@@ -545,6 +597,7 @@ def train():
         nlayer=nlayer,
         nclass=nclass,
         key=key,
+        bidirectional=bidirectional,
         use_scan=use_scan,
         quasi=quasi,  # XG addition
     )
