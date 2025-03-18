@@ -164,7 +164,7 @@ class SingleScaleGRU(eqx.Module):
     encoder: MLP
     grus: List[List[GRU]]
     bi_grus: List[List[GRU]]
-    acts: List[LinActLinGLU]
+    acts: List[List[LinActLinGLU]]
     mlps: List[MLP]
     classifier: MLP
     norms: List[eqx.nn.LayerNorm]
@@ -187,11 +187,12 @@ class SingleScaleGRU(eqx.Module):
         quasi: bool,
     ):
         if bidirectional:
-            keycount = 1 + (nchannel + 2) * nlayer * 2 + 1 + 1  # +1 for dropout
+            keycount = 1 + (nchannel + 1) * nlayer * 3 + 1 + 1  # +1 for dropout
         else:
             keycount = 1 + (nchannel + 2) * nlayer + 1 + 1  # +1 for dropout
         
         print(f"Keycount: {keycount}")
+        print(f"Bidirectional: {bidirectional}")
         keys = jax.random.split(key, keycount)
 
         self.bidirectional = bidirectional
@@ -240,8 +241,11 @@ class SingleScaleGRU(eqx.Module):
             for i in range(nlayer)
         ]
         self.acts = [
-            LinActLinGLU(hidden_size=nstate, key=keys[int(i + 1 + 2 * (nchannel + 1) * nlayer)])
-            for i in range(nlayer)
+                [
+                LinActLinGLU(hidden_size=nstate//nchannel, key=keys[int(2* nchannel * nlayer + (nchannel * j) + i)])
+                for j in range(nchannel)
+            ]
+            for i in range(nchannel)
         ]
         assert len(self.grus) == nlayer
         assert len(self.grus[0]) == nchannel
@@ -255,7 +259,7 @@ class SingleScaleGRU(eqx.Module):
             ninp=nstate,
             nstate=nstate,
             nout=nclass,
-            key=keys[int((nchannel + 2) * nlayer * 2 + 1)],
+            key=keys[int((nchannel + 1) * nlayer * 2 + 1)],
         )
 
         self.norms = [
@@ -309,6 +313,7 @@ class SingleScaleGRU(eqx.Module):
                         )
                         x_back = x_back[::-1]
                         x = (x + x_back) / 2
+                    x = self.acts[i][ch](x)
                 else:
                     x, samp_iters = seq1d(
                         model_func,
@@ -330,10 +335,10 @@ class SingleScaleGRU(eqx.Module):
                         )
                         x_back = x_back[::-1]
                         x = (x + x_back) / 2
+                    x = self.acts[i][ch](x)
                 x_from_all_channels.append(x)
 
             x = jnp.concatenate(x_from_all_channels, axis=-1)
-            x = self.acts[i](x)
             x = jax.vmap(self.norms[i + 1])(  # XG change
                 x + inputs
             )  # add and norm after multichannel GRU layer
@@ -440,9 +445,10 @@ jax.config.update("jax_enable_x64", True)
 jax.config.update("jax_debug_nans", True)
 
 
-@partial(jax.jit, static_argnames=("model"))
+@partial(jax.jit, static_argnames=("static"))
 def rollout(
-    model: eqx.Module,
+    static: Any,
+    params: Any,
     y0: jnp.ndarray,
     inputs: jnp.ndarray,
     yinit_guess: List[jnp.ndarray],
@@ -454,6 +460,7 @@ def rollout(
 
     return: (nclass,)
     """
+    model = eqx.combine(params, static)
     out, samp_iters = model(inputs, y0, yinit_guess)
     # jax.debug.print(
     #     "inside of rollout, samp_iters is {samp_iters}", samp_iters=samp_iters
@@ -474,12 +481,12 @@ def loss_fn(
     yinit_guess (nbatch, nsequence, nstate)
     batch (nbatch, nsequence, ninp) (nbatch,)
     """
-    model = eqx.combine(params, static)
+    # model = eqx.combine(params, static)
     x, y = batch
 
     # ypred: (nbatch, nclass)
-    ypred, samp_iters = jax.vmap(rollout, in_axes=(None, 0, 0, 0), out_axes=(0))(
-        model, y0, x, yinit_guess
+    ypred, samp_iters = jax.vmap(rollout, in_axes=(None, None, 0, 0, 0), out_axes=(0))(
+        static, params, y0, x, yinit_guess
     )
     # jax.debug.print(
     #     "inside of loss_fn, samp_iters is {samp_iters}", samp_iters=samp_iters
@@ -518,21 +525,22 @@ def update_step(
 
 
 def train():
-    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"]="false"
+    # os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"]="false"
+    # os.environ["XLA_FLAGS"]='--xla_dump_to=/tmp/foo'
     wandb.init(project="elk")
     # set up argparse for the hyperparameters above
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--nepochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--version", type=int, default=0)
     parser.add_argument("--ninps", type=int, default=3)
-    parser.add_argument("--nstates", type=int, default=64)
+    parser.add_argument("--nstates", type=int, default=256)
     parser.add_argument("--nsequence", type=int, default=1024)
     parser.add_argument("--nclass", type=int, default=10)
     parser.add_argument("--nlayer", type=int, default=4)
-    parser.add_argument("--nchannel", type=int, default=1)
+    parser.add_argument("--nchannel", type=int, default=32)
     parser.add_argument("--patience", type=int, default=1000)
     parser.add_argument("--patience_metric", type=str, default="accuracy")
     parser.add_argument("--precision", type=int, default=32)
